@@ -8,11 +8,13 @@ import { toSimpleSmartAccount, ToSimpleSmartAccountReturnType } from 'permission
 import {
   createPimlicoClient,
 } from 'permissionless/clients/pimlico'
-import { createPublicClient, http, Account } from 'viem'
+import { createPublicClient, http, Account, parseEther, encodeFunctionData, erc20Abi, parseAbi } from 'viem'
 import { baseSepolia } from 'viem/chains'
 import { createSmartAccountClient, SmartAccountClient } from "permissionless";
 import {  entryPoint07Address } from "viem/account-abstraction";
 import { generatePrivateKey, privateKeyToAccount, privateKeyToAddress } from "viem/accounts"
+import { abi as SwapRouterABI } from '@uniswap/v3-periphery/artifacts/contracts/SwapRouter.sol/SwapRouter.json';
+
 
 /* DOCUMENTATION:
   Why cant we use MetaMask?
@@ -45,6 +47,35 @@ const pimlicoClient = createPimlicoClient({
   }
 })
 
+type ExactInputSingleParams = {
+  tokenIn: `0x${string}`;
+  tokenOut: `0x${string}`;
+  fee: number;
+  recipient: `0x${string}`;
+  deadline: bigint;
+  amountIn: bigint;
+  amountOutMinimum: bigint;
+  sqrtPriceLimitX96: bigint;
+};
+
+// Base Sepolia USDC address
+const USDC_ADDRESS = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
+// Uniswap V3 Router address on Base Sepolia
+const UNISWAP_SEPOLIA_V3_ROUTER = "0x2626664c2603336E57B271c5C0b26F421741e481";
+// WETH address on Base Sepolia
+const WETH_ADDRESS = "0x4200000000000000000000000000000000000006";
+
+// WETH ABI (minimal for deposit function)
+const WETH_ABI = [
+  {
+    inputs: [],
+    name: "deposit",
+    outputs: [],
+    stateMutability: "payable",
+    type: "function"
+  }
+] as const;
+
 declare global {
   interface Window {
     ethereum?: ethers.Eip1193Provider;
@@ -65,7 +96,8 @@ export default function Home() {
   const [simpleSmartAccount, setSimpleSmartAccount] = useState<ToSimpleSmartAccountReturnType>();
   const [smartAccountClient, setSmartAccountClient] = useState<SmartAccountClient>();
   const [smartAccountBalance, setSmartAccountBalance] = useState<string | null>("----");
-
+  const [smartAccountBalanceInUSDC, setSmartAccountBalanceInUSDC] = useState<string | null>("----");
+  const [smartAccountBalanceInWETH, setSmartAccountBalanceInWETH] = useState<string | null>("----");
   const [transactions, setTransactions] = useState<TransactionData[]>([]);
   const [toAddress, setToAddress] = useState<string>("");
   const [value, setValue] = useState<string>("");
@@ -183,6 +215,139 @@ export default function Home() {
     }
   }
 
+  const swapEthToWETH = async () => {
+    try {
+      if (!simpleSmartAccount || !smartAccountClient) {
+        throw new Error("Smart account or smart account client not found");
+      }
+
+      // Amount of ETH to wrap (0.000001 ETH)
+      const amountIn = parseEther("0.000001");
+
+      // Send the transaction
+      const txHash = await smartAccountClient.sendUserOperation({
+        account: simpleSmartAccount,
+        calls: [
+          {
+            to: WETH_ADDRESS,
+            abi: WETH_ABI,
+            functionName: "deposit",
+            value: amountIn
+          }
+        ]
+      });
+
+      console.log("Wrap ETH transaction hash:", txHash);
+      alert(`ETH wrapped to WETH! Transaction hash: ${txHash}`);
+      
+      // Update balances after wrap
+      getSmartAccountBalance();
+    } catch (error) {
+      console.error("Error wrapping ETH to WETH:", error);
+      alert(`Error wrapping ETH to WETH: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  const swapWETHToUSDC = async () => {
+    try {
+      if (!simpleSmartAccount || !smartAccountClient) {
+        throw new Error("Smart account or smart account client not found");
+      }
+
+      // Amount of WETH to swap (0.000001 WETH)
+      const amountIn = parseEther("0.000001");
+      
+      // Get current timestamp and add 20 minutes for deadline
+      const deadline = Math.floor(Date.now() / 1000) + 1200;
+
+      // Prepare the swap parameters
+      const params: ExactInputSingleParams = {
+        tokenIn: WETH_ADDRESS as `0x${string}`,
+        tokenOut: USDC_ADDRESS as `0x${string}`,
+        fee: 3000, // 0.3% fee tier
+        recipient: simpleSmartAccount.address as `0x${string}`,
+        deadline: BigInt(deadline),
+        amountIn: amountIn,
+        amountOutMinimum: BigInt(0), // No minimum amount out (be careful with this in production!)
+        sqrtPriceLimitX96: BigInt(0) // No price limit
+      };
+
+      // Encode the function call
+      const data = encodeFunctionData({
+        abi: SwapRouterABI,
+        functionName: 'exactInputSingle',
+        args: [params]
+      });
+
+      // Send the transaction
+      const txHash = await smartAccountClient.sendUserOperation({
+        account: simpleSmartAccount,
+        calls: [
+          {
+            to: WETH_ADDRESS as `0x${string}`, //WETH
+            abi: parseAbi(["function approve(address,uint)"]),
+            functionName: "approve",
+            args: [UNISWAP_SEPOLIA_V3_ROUTER, parseEther("0.000001")],
+          },
+          {
+            to: UNISWAP_SEPOLIA_V3_ROUTER, //UniV3 Router
+            abi: SwapRouterABI,
+            functionName: "exactInputSingle",
+            args: [
+              [
+                params.tokenIn,
+                params.tokenOut,
+                params.fee,
+                params.recipient,
+                params.deadline,
+                params.amountIn,
+                params.amountOutMinimum,
+                params.sqrtPriceLimitX96,
+              ],
+            ],
+          },
+        ],
+      });
+      console.log("🟠 Swapping WETH to USDC....");
+
+      console.log("Swap transaction hash:", txHash);
+
+      let { receipt } = await smartAccountClient.waitForUserOperationReceipt({
+        hash: txHash,
+        retryCount: 7,
+        pollingInterval: 2000,
+      });
+
+      console.log("🟢 Receipt:", receipt);
+      
+      // Update balance after swap
+      getSmartAccountBalance();
+    } catch (error) {
+      console.error("Error swapping WETH to USDC:", error);
+      alert(`Error swapping WETH to USDC: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  const getSmartAccountBalanceInUSDC = async () => {
+    const balance = await publicClient.readContract({
+      address: USDC_ADDRESS,
+      abi: erc20Abi,
+      functionName: 'balanceOf',
+      args: [simpleSmartAccount!.address]
+    })
+    setSmartAccountBalanceInUSDC(ethers.formatEther(balance))
+  }
+
+  const getSmartAccountBalanceInWETH = async () => {
+    const balance = await publicClient.readContract({
+      address: WETH_ADDRESS,
+      abi: erc20Abi,
+      functionName: 'balanceOf',
+      args: [simpleSmartAccount!.address]
+    })
+    setSmartAccountBalanceInWETH(ethers.formatEther(balance))
+  }
+
   return (
     <div className={styles.page}>
       <main className={styles.main}>
@@ -192,6 +357,8 @@ export default function Home() {
             <p>Wallet Address: {address}</p>
             <p>Smart Account Address: {simpleSmartAccount?.address} <span>{`<--- Send ETH to this address `}</span></p>
             <p>Smart Account Balance: {smartAccountBalance} <button onClick={() => getSmartAccountBalance()}>Refresh balance</button></p>
+            <p>Smart Account Balance in WETH: {smartAccountBalanceInWETH} <button onClick={() => getSmartAccountBalanceInWETH()}>Refresh balance</button></p>
+            <p>Smart Account Balance in USDC: {smartAccountBalanceInUSDC} <button onClick={() => getSmartAccountBalanceInUSDC()}>Refresh balance</button></p>
 
             <h2>Transaction Builder</h2>
             <div style={{ display: 'flex', flexDirection: 'row', gap: '10px' }}>
@@ -214,6 +381,12 @@ export default function Home() {
             </ul>
 
             <button onClick={sendTransaction}>Send Transaction</button>
+
+            <h2>Wrap ETH to WETH</h2>
+            <button onClick={swapEthToWETH}>Wrap 0.000001 ETH to WETH</button>
+
+            <h2>Swap WETH to USDC</h2>
+            <button onClick={swapWETHToUSDC}>Swap 0.000001 ETH to USDC</button>
           </>
         ):
           <>
