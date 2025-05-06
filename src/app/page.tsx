@@ -3,17 +3,18 @@
 import styles from "./page.module.css";
 import { PredictedSafeProps } from "@safe-global/protocol-kit";
 import { ethers } from "ethers";
-import { useState } from "react";
-import { toSimpleSmartAccount, ToSimpleSmartAccountReturnType } from 'permissionless/accounts'
+import {  useState } from "react";
+import { toSafeSmartAccount, ToSafeSmartAccountReturnType } from 'permissionless/accounts'
 import {
   createPimlicoClient,
 } from 'permissionless/clients/pimlico'
-import { createPublicClient, http, Account, parseEther, encodeFunctionData, erc20Abi, parseAbi } from 'viem'
+import { createPublicClient, http, Account, parseEther, encodeFunctionData, erc20Abi, parseAbi, getContract, parseErc6492Signature, encodePacked, hexToBigInt, formatUnits, formatEther, parseUnits } from 'viem'
 import { baseSepolia } from 'viem/chains'
 import { createSmartAccountClient, SmartAccountClient } from "permissionless";
 import {  entryPoint07Address } from "viem/account-abstraction";
 import { generatePrivateKey, privateKeyToAccount, privateKeyToAddress } from "viem/accounts"
 import { abi as SwapRouterABI } from '@uniswap/v3-periphery/artifacts/contracts/SwapRouter.sol/SwapRouter.json';
+import { eip2612Abi, eip2612Permit } from "@/lib/permit-helper";
 
 
 /* DOCUMENTATION:
@@ -64,6 +65,10 @@ const USDC_ADDRESS = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
 const UNISWAP_SEPOLIA_V3_ROUTER = "0x2626664c2603336E57B271c5C0b26F421741e481";
 // WETH address on Base Sepolia
 const WETH_ADDRESS = "0x4200000000000000000000000000000000000006";
+// Circle Paymaster address on Base Sepolia
+const CIRCLE_PAYMASTER_ADDRESS = "0x31BE08D380A21fc740883c0BC434FcFc88740b58";
+
+const MAX_GAS_USDC = 1000000n // 1 USDC
 
 // WETH ABI (minimal for deposit function)
 const WETH_ABI = [
@@ -93,7 +98,7 @@ export default function Home() {
   const [account, setAccount] = useState<Account | null>(null);
   const [privateKey, setPrivateKey] = useState<string | null>(null);
   const [address, setAddress] = useState<string | null>(null);
-  const [simpleSmartAccount, setSimpleSmartAccount] = useState<ToSimpleSmartAccountReturnType>();
+  const [safeSmartAccount, setSafeSmartAccount] = useState<ToSafeSmartAccountReturnType>();
   const [smartAccountClient, setSmartAccountClient] = useState<SmartAccountClient>();
   const [smartAccountBalance, setSmartAccountBalance] = useState<string | null>("----");
   const [smartAccountBalanceInUSDC, setSmartAccountBalanceInUSDC] = useState<string | null>("----");
@@ -112,18 +117,19 @@ export default function Home() {
     const account = privateKeyToAccount(privateKey)
     setAccount(account)
 
-    const simpleSmartAccount = await toSimpleSmartAccount({
+    const safeSmartAccount = await toSafeSmartAccount({
       client: publicClient,
-      owner: account,
+      owners: [account],
       entryPoint: {
-            address: entryPoint07Address,
-            version: "0.7"
+        address: entryPoint07Address,
+        version: "0.7"
       },
+      version: "1.4.1"
     })
-    setSimpleSmartAccount(simpleSmartAccount)
+    setSafeSmartAccount(safeSmartAccount)
 
     const smartAccountClient = createSmartAccountClient({
-      account: simpleSmartAccount,
+      account: safeSmartAccount,
       chain: baseSepolia,
       bundlerTransport: http(pimlicoBundlerUrl),
       userOperation: {
@@ -136,7 +142,7 @@ export default function Home() {
   }
 
   const getSmartAccountBalance = async () => {
-    const balance = await publicClient.getBalance({ address: simpleSmartAccount!.address })
+    const balance = await publicClient.getBalance({ address: safeSmartAccount!.address })
     setSmartAccountBalance(ethers.formatEther(balance))
   }
 
@@ -148,7 +154,7 @@ export default function Home() {
     
     const newTransaction: TransactionData = {
       to: toAddress,
-      value: value ? ethers.parseEther(value).toString() : "0",
+      value: value,
       data: data || "0x",
     };
     
@@ -162,7 +168,7 @@ export default function Home() {
 
   const sendTransaction = async () => {
     try {
-      if (!simpleSmartAccount || !smartAccountClient) {
+      if (!safeSmartAccount || !smartAccountClient) {
         throw new Error("Smart account or smart account client not found");
       }
 
@@ -171,26 +177,24 @@ export default function Home() {
       }
 
       // Check balance first
-      const balance = await publicClient.getBalance({ address: simpleSmartAccount.address });
-      console.log("Smart account address:", simpleSmartAccount.address);
-      console.log("Account balance:", ethers.formatEther(balance));
+      const balance = await publicClient.getBalance({ address: safeSmartAccount.address });
 
       if (balance === BigInt(0)) {
-        alert(`Please send some ETH to your smart account: ${simpleSmartAccount.address}`);
+        alert(`Please send some ETH to your smart account: ${safeSmartAccount.address}`);
         return;
       }
       
       const calls = transactions.map((tx) => {
-        console.log(`Sending transaction to: ${tx.to}, value: ${tx.value}`);
+        const value = tx.value ? ethers.parseEther(tx.value).toString() : "0";
 
         return {
           to: tx.to,
-          value: BigInt(tx.value),
+          value: BigInt(value),
         }
       });
 
       const gasPrice = await smartAccountClient.estimateUserOperationGas({
-        account: simpleSmartAccount,
+        account: safeSmartAccount,
         calls
       })
 
@@ -215,9 +219,172 @@ export default function Home() {
     }
   }
 
+  //REFERENCE: https://developers.circle.com/stablecoins/quickstart-circle-paymaster
+  const sendTransactionWithCirclePaymaster = async () => {
+    try {
+      if (!safeSmartAccount || !smartAccountClient) {
+        throw new Error("Smart account or smart account client not found");
+      }
+
+      if (transactions.length === 0) {
+        throw new Error("No transactions to send");
+      }
+
+      const usdc = getContract({
+        client: publicClient,
+        address: USDC_ADDRESS,
+        abi: [...erc20Abi, ...eip2612Abi],
+      })
+
+
+      // Check balance first
+      const usdcBalance = await usdc.read.balanceOf([safeSmartAccount!.address])
+      if (usdcBalance === 0n) {
+        alert("Please send some USDC to your smart account");
+        return;
+      }
+
+      //EIP-2612 permit to authorize the paymaster to spend the smart wallet's USDC
+      const permitData = await eip2612Permit({
+        token: usdc,
+        chain: baseSepolia,
+        ownerAddress: safeSmartAccount!.address,
+        spenderAddress: CIRCLE_PAYMASTER_ADDRESS,
+        value: MAX_GAS_USDC
+      })
+
+      const signData = { ...permitData, primaryType: 'Permit' as const }
+      const wrappedPermitSignature = await safeSmartAccount?.signTypedData(signData)
+      const { signature: permitSignature } = parseErc6492Signature(wrappedPermitSignature as `0x${string}`)
+
+      const calls = transactions.map((tx) => {
+        const value = tx.value ? parseUnits(tx.value, 6).toString() : "0";
+
+        return {
+          to: usdc.address,
+          abi: usdc.abi,
+          functionName: 'transfer',
+          args: [tx.to, value],
+        }
+      });
+
+      const paymaster = CIRCLE_PAYMASTER_ADDRESS
+      const paymasterData = encodePacked(
+        ['uint8', 'address', 'uint256', 'bytes'],
+        [
+          0, // Reserved for future use
+          USDC_ADDRESS, // Token address
+          MAX_GAS_USDC, // Max spendable gas in USDC
+          permitSignature, // EIP-2612 permit signature
+        ],
+      )
+
+      const additionalGasCharge = hexToBigInt(
+        (
+          await publicClient.call({
+            to: paymaster,
+            data: encodeFunctionData({
+              abi: parseAbi(['function additionalGasCharge() returns (uint256)']),
+              functionName: 'additionalGasCharge',
+            }),
+          })
+        ).data as `0x${string}`,
+      )
+
+      const { standard: fees } = await pimlicoClient.request({
+        method: 'pimlico_getUserOperationGasPrice',
+        params: []
+      })
+
+      const maxFeePerGas = hexToBigInt(fees.maxFeePerGas)
+      const maxPriorityFeePerGas = hexToBigInt(fees.maxPriorityFeePerGas)
+
+      console.log('Max fee per gas:', maxFeePerGas)
+      console.log('Max priority fee per gas:', maxPriorityFeePerGas)
+      console.log('Estimating user op gas limits...');
+
+      const {
+        callGasLimit,
+        preVerificationGas,
+        verificationGasLimit,
+        paymasterPostOpGasLimit,
+        paymasterVerificationGasLimit,
+      } = await pimlicoClient.estimateUserOperationGas({
+        account: safeSmartAccount,
+        calls,
+        paymaster,
+        paymasterData,
+        // Make sure to pass in the `additionalGasCharge` from the paymaster
+        paymasterPostOpGasLimit: additionalGasCharge,
+        // Use very low gas fees for estimation to ensure successful permit/transfer,
+        // since the bundler will simulate the user op with very high gas limits
+        maxFeePerGas: 1n,
+        maxPriorityFeePerGas: 1n,
+      })
+
+      console.log('Call gas limit:', callGasLimit)
+      console.log('Pre-verification gas:', preVerificationGas)
+      console.log('Verification gas limit:', verificationGasLimit)
+      console.log('Paymaster post op gas limit:', paymasterPostOpGasLimit)
+      console.log('Paymaster verification gas limit:', paymasterVerificationGasLimit)
+
+      console.log('Sending user op...')
+
+      const userOpHash = await smartAccountClient.sendUserOperation({
+        account: safeSmartAccount,
+        calls,
+        callGasLimit,
+        preVerificationGas,
+        verificationGasLimit,
+        paymaster,
+        paymasterData,
+        paymasterVerificationGasLimit,
+        // Make sure that `paymasterPostOpGasLimit` is always at least
+        // `additionalGasCharge`, regardless of what the bundler estimated.
+        paymasterPostOpGasLimit: BigInt(Math.max(
+          Number(paymasterPostOpGasLimit),
+          Number(additionalGasCharge),
+        )),
+        maxFeePerGas,
+        maxPriorityFeePerGas,
+      })
+
+      console.log('Submitted user op:', userOpHash)
+      console.log('Waiting for execution...')
+
+      const userOpReceipt = await smartAccountClient.waitForUserOperationReceipt({
+        hash: userOpHash,
+      })
+
+      console.log('Done! Details:')
+      console.log('  success:', userOpReceipt.success)
+      console.log('  actualGasUsed:', userOpReceipt.actualGasUsed)
+      console.log(
+        '  actualGasCost:',
+        formatUnits(userOpReceipt.actualGasCost, 18),
+        'ETH',
+      )
+      console.log('  transaction hash:', userOpReceipt.receipt.transactionHash)
+      console.log('  transaction gasUsed:', userOpReceipt.receipt.gasUsed)
+
+      const usdcBalanceAfter = await usdc.read.balanceOf([safeSmartAccount!.address])
+      //@ts-ignore
+      const usdcConsumed = usdcBalance - usdcBalanceAfter - transactions.reduce((acc, tx) => acc + (tx.value ? parseUnits(tx.value, 6).toBigInt() : 0n), 0n) // Exclude what we sent
+
+      console.log('  USDC paid:', formatUnits(usdcConsumed, 6))
+      alert(`Transaction sent! Hash: ${userOpReceipt.receipt.transactionHash}`);
+
+      // Update balance
+      getSmartAccountBalanceInUSDC()
+    } catch (error) {
+      console.error("Error sending transactions:", error);
+      alert(`Error sending transactions: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   const swapEthToWETH = async () => {
     try {
-      if (!simpleSmartAccount || !smartAccountClient) {
+      if (!safeSmartAccount || !smartAccountClient) {
         throw new Error("Smart account or smart account client not found");
       }
 
@@ -226,7 +393,7 @@ export default function Home() {
 
       // Send the transaction
       const txHash = await smartAccountClient.sendUserOperation({
-        account: simpleSmartAccount,
+        account: safeSmartAccount,
         calls: [
           {
             to: WETH_ADDRESS,
@@ -242,6 +409,7 @@ export default function Home() {
       
       // Update balances after wrap
       getSmartAccountBalance();
+      getSmartAccountBalanceInWETH()
     } catch (error) {
       console.error("Error wrapping ETH to WETH:", error);
       alert(`Error wrapping ETH to WETH: ${error instanceof Error ? error.message : String(error)}`);
@@ -250,7 +418,7 @@ export default function Home() {
 
   const swapWETHToUSDC = async () => {
     try {
-      if (!simpleSmartAccount || !smartAccountClient) {
+      if (!safeSmartAccount || !smartAccountClient) {
         throw new Error("Smart account or smart account client not found");
       }
 
@@ -265,23 +433,16 @@ export default function Home() {
         tokenIn: WETH_ADDRESS as `0x${string}`,
         tokenOut: USDC_ADDRESS as `0x${string}`,
         fee: 3000, // 0.3% fee tier
-        recipient: simpleSmartAccount.address as `0x${string}`,
+        recipient: safeSmartAccount.address as `0x${string}`,
         deadline: BigInt(deadline),
         amountIn: amountIn,
         amountOutMinimum: BigInt(0), // No minimum amount out (be careful with this in production!)
         sqrtPriceLimitX96: BigInt(0) // No price limit
       };
 
-      // Encode the function call
-      const data = encodeFunctionData({
-        abi: SwapRouterABI,
-        functionName: 'exactInputSingle',
-        args: [params]
-      });
-
       // Send the transaction
       const txHash = await smartAccountClient.sendUserOperation({
-        account: simpleSmartAccount,
+        account: safeSmartAccount,
         calls: [
           {
             to: WETH_ADDRESS as `0x${string}`, //WETH
@@ -312,16 +473,17 @@ export default function Home() {
 
       console.log("Swap transaction hash:", txHash);
 
-      let { receipt } = await smartAccountClient.waitForUserOperationReceipt({
+      const { receipt } = await smartAccountClient.waitForUserOperationReceipt({
         hash: txHash,
         retryCount: 7,
         pollingInterval: 2000,
       });
 
-      console.log("🟢 Receipt:", receipt);
-      
+      alert(`Transaction sent! Hash: ${receipt.transactionHash}`);
+
       // Update balance after swap
       getSmartAccountBalance();
+      getSmartAccountBalanceInUSDC()
     } catch (error) {
       console.error("Error swapping WETH to USDC:", error);
       alert(`Error swapping WETH to USDC: ${error instanceof Error ? error.message : String(error)}`);
@@ -333,9 +495,9 @@ export default function Home() {
       address: USDC_ADDRESS,
       abi: erc20Abi,
       functionName: 'balanceOf',
-      args: [simpleSmartAccount!.address]
+      args: [safeSmartAccount!.address]
     })
-    setSmartAccountBalanceInUSDC(ethers.formatEther(balance))
+    setSmartAccountBalanceInUSDC(ethers.formatUnits(balance, 6))
   }
 
   const getSmartAccountBalanceInWETH = async () => {
@@ -343,7 +505,7 @@ export default function Home() {
       address: WETH_ADDRESS,
       abi: erc20Abi,
       functionName: 'balanceOf',
-      args: [simpleSmartAccount!.address]
+      args: [safeSmartAccount!.address]
     })
     setSmartAccountBalanceInWETH(ethers.formatEther(balance))
   }
@@ -351,16 +513,16 @@ export default function Home() {
   return (
     <div className={styles.page}>
       <main className={styles.main}>
-        {account && address && simpleSmartAccount ? (
+        {account && address && safeSmartAccount ? (
           <>
             <p>Private Key: {privateKey}</p>
             <p>Wallet Address: {address}</p>
-            <p>Smart Account Address: {simpleSmartAccount?.address} <span>{`<--- Send ETH to this address `}</span></p>
+            <p>Smart Account Address: {safeSmartAccount?.address} <span>{`<--- Send ETH to this address `}</span></p>
             <p>Smart Account Balance: {smartAccountBalance} <button onClick={() => getSmartAccountBalance()}>Refresh balance</button></p>
             <p>Smart Account Balance in WETH: {smartAccountBalanceInWETH} <button onClick={() => getSmartAccountBalanceInWETH()}>Refresh balance</button></p>
             <p>Smart Account Balance in USDC: {smartAccountBalanceInUSDC} <button onClick={() => getSmartAccountBalanceInUSDC()}>Refresh balance</button></p>
 
-            <h2>Transaction Builder</h2>
+            <h2>Transactions Builder</h2>
             <div style={{ display: 'flex', flexDirection: 'row', gap: '10px' }}>
               <div style={{ display: 'flex', flexDirection: 'row', gap: '10px' }}>
                 <input type="text" placeholder="To" value={toAddress} onChange={(e) => setToAddress(e.target.value)} />
@@ -380,7 +542,13 @@ export default function Home() {
               ))}
             </ul>
 
-            <button onClick={sendTransaction}>Send Transaction</button>
+            <h2>Send simple transactions</h2>
+            <button onClick={sendTransaction}>Send transactions</button>
+
+            <h2>Send transactions with Circle Paymaster</h2>
+            <button onClick={sendTransactionWithCirclePaymaster}>Send transactions with Circle Paymaster</button>
+
+            <p style={{ textAlign: 'center' }}>---------------------------------------------------------------------</p>
 
             <h2>Wrap ETH to WETH</h2>
             <button onClick={swapEthToWETH}>Wrap 0.000001 ETH to WETH</button>
