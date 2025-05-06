@@ -110,7 +110,7 @@ export default function Home() {
 
   const generateWallet = async () => {
     // replace with your own private key if you want to use your own
-    const privateKey = generatePrivateKey();
+    const privateKey = '0xcbaf1f4b2282dd0ded3889d121596dd2c903ca1175e32c97a49378988be51e37';
     setPrivateKey(privateKey)
     setAddress(privateKeyToAddress(privateKey))
 
@@ -367,11 +367,10 @@ export default function Home() {
       console.log('  transaction hash:', userOpReceipt.receipt.transactionHash)
       console.log('  transaction gasUsed:', userOpReceipt.receipt.gasUsed)
 
-      const usdcBalanceAfter = await usdc.read.balanceOf([safeSmartAccount!.address])
-      //@ts-ignore
-      const usdcConsumed = usdcBalance - usdcBalanceAfter - transactions.reduce((acc, tx) => acc + (tx.value ? parseUnits(tx.value, 6).toBigInt() : 0n), 0n) // Exclude what we sent
-
-      console.log('  USDC paid:', formatUnits(usdcConsumed, 6))
+      //const usdcBalanceAfter = await usdc.read.balanceOf([safeSmartAccount!.address])
+      //const usdcConsumed = usdcBalance - usdcBalanceAfter - transactions.reduce((acc, tx) => acc + (tx.value ? parseUnits(tx.value, 6).toBigInt() : 0n), 0n) // Exclude what we sent
+      //console.log('  USDC paid:', formatUnits(usdcBalance - usdcBalanceAfter, 6))
+      
       alert(`Transaction sent! Hash: ${userOpReceipt.receipt.transactionHash}`);
 
       // Update balance
