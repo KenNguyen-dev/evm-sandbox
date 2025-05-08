@@ -1,7 +1,6 @@
 'use client';
 
 import styles from './page.module.css';
-import { PredictedSafeProps } from '@safe-global/protocol-kit';
 import { ethers } from 'ethers';
 import { useState } from 'react';
 import {
@@ -37,7 +36,7 @@ import {
 import { eip2612Abi, eip2612Permit } from '@/lib/permit-helper';
 import { UniswapSwapRouterAbi } from '../../abi/UniswapSwapRouterAbi';
 import { UniswapQuoterAbi } from '../../abi/UniswapQuoterAbi';
-
+import { useRouter } from 'next/navigation';
 /* DOCUMENTATION:
   Why cant we use MetaMask?
   https://docs.pimlico.io/guides/eip7702/erc4337-vs-eip7702
@@ -97,13 +96,6 @@ const WETH_ABI = [
   },
 ] as const;
 
-declare global {
-  interface Window {
-    ethereum?: ethers.Eip1193Provider;
-    predictedSafe?: PredictedSafeProps;
-  }
-}
-
 export interface TransactionData {
   to: string;
   value: string;
@@ -111,6 +103,7 @@ export interface TransactionData {
 }
 
 export default function Home() {
+  const router = useRouter();
   const [account, setAccount] = useState<Account | null>(null);
   const [privateKey, setPrivateKey] = useState<string | null>(null);
   const [address, setAddress] = useState<string | null>(null);
@@ -964,6 +957,8 @@ export default function Home() {
             </button>
           </>
         )}
+
+        <button onClick={() => router.push('/metamask')}>To Metamask</button>
       </main>
     </div>
   );
