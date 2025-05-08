@@ -11,7 +11,9 @@
   "dependencies": {
     "@safe-global/protocol-kit": "^6.0.3",
     "@safe-global/relay-kit": "^4.0.2",
+    "@uniswap/sdk-core": "^7.7.2",
     "@uniswap/v3-periphery": "^1.4.4",
+    "@uniswap/v3-sdk": "^3.25.2",
     "ethers": "6.13.5",
     "next": "15.3.1",
     "permissionless": "^0.2.43",

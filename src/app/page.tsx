@@ -22,9 +22,9 @@ import {
   encodePacked,
   hexToBigInt,
   formatUnits,
-  formatEther,
   parseUnits,
   Call,
+  Hex,
 } from 'viem';
 import { baseSepolia } from 'viem/chains';
 import { createSmartAccountClient, SmartAccountClient } from 'permissionless';
@@ -34,8 +34,9 @@ import {
   privateKeyToAccount,
   privateKeyToAddress,
 } from 'viem/accounts';
-import { abi as SwapRouterABI } from '@uniswap/v3-periphery/artifacts/contracts/SwapRouter.sol/SwapRouter.json';
 import { eip2612Abi, eip2612Permit } from '@/lib/permit-helper';
+import { UniswapSwapRouterAbi } from '../../abi/UniswapSwapRouterAbi';
+import { UniswapQuoterAbi } from '../../abi/UniswapQuoterAbi';
 
 /* DOCUMENTATION:
   Why cant we use MetaMask?
@@ -69,25 +70,19 @@ const pimlicoClient = createPimlicoClient({
   },
 });
 
-type ExactInputSingleParams = {
-  tokenIn: `0x${string}`;
-  tokenOut: `0x${string}`;
-  fee: number;
-  recipient: `0x${string}`;
-  deadline: bigint;
-  amountIn: bigint;
-  amountOutMinimum: bigint;
-  sqrtPriceLimitX96: bigint;
-};
-
 // Base Sepolia USDC address
 const USDC_ADDRESS = '0x036CbD53842c5426634e7929541eC2318f3dCF7e';
 // Uniswap V3 Router address on Base Sepolia
-const UNISWAP_SEPOLIA_V3_ROUTER = '0x2626664c2603336E57B271c5C0b26F421741e481';
+const UNISWAP_SEPOLIA_V3_ROUTER = '0x94cC0AaC535CCDB3C01d6787D6413C739ae12bc4';
 // WETH address on Base Sepolia
 const WETH_ADDRESS = '0x4200000000000000000000000000000000000006';
 // Circle Paymaster address on Base Sepolia
 const CIRCLE_PAYMASTER_ADDRESS = '0x31BE08D380A21fc740883c0BC434FcFc88740b58';
+// Uniswap V3 Pool Factory address on Base Sepolia
+const POOL_FACTORY_CONTRACT_ADDRESS =
+  '0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24';
+// Uniswap V3 Quoter address on Base Sepolia
+const QUOTER_CONTRACT_ADDRESS = '0xC5290058841028F1614F3A6F0F5816cAd0df5E27';
 
 const MAX_GAS_USDC = 1000000n; // 1 USDC
 
@@ -139,8 +134,7 @@ export default function Home() {
 
   const generateWallet = async () => {
     // replace with your own private key if you want to use your own
-    const privateKey =
-      '0xcbaf1f4b2282dd0ded3889d121596dd2c903ca1175e32c97a49378988be51e37';
+    const privateKey = generatePrivateKey();
     setPrivateKey(privateKey);
     setAddress(privateKeyToAddress(privateKey));
 
@@ -440,14 +434,14 @@ export default function Home() {
     }
   };
 
-  const swapEthToWETH = async () => {
+  const wrapEthToWETH = async () => {
     try {
       if (!safeSmartAccount || !smartAccountClient) {
         throw new Error('Smart account or smart account client not found');
       }
 
       // Amount of ETH to wrap (0.000001 ETH)
-      const amountIn = parseEther('0.000001');
+      const amountIn = parseEther('0.001');
 
       // Send the transaction
       const txHash = await smartAccountClient.sendUserOperation({
@@ -478,56 +472,130 @@ export default function Home() {
     }
   };
 
+  // Add Quoter ABI
+
+  /**
+   * Get a quote for swapping ETH to USDC
+   * @param amountIn Amount of ETH to swap (in wei)
+   * @returns Expected amount of USDC out
+   */
+  async function getWethToUsdcQuote(amountIn: bigint): Promise<bigint> {
+    try {
+      // First get the pool address from the factory
+      const poolAddress = await publicClient.readContract({
+        address: POOL_FACTORY_CONTRACT_ADDRESS,
+        abi: parseAbi([
+          'function getPool(address,address,uint24) external view returns (address)',
+        ]),
+        functionName: 'getPool',
+        args: [WETH_ADDRESS, USDC_ADDRESS, 3000],
+      });
+
+      if (
+        !poolAddress ||
+        poolAddress === '0x0000000000000000000000000000000000000000'
+      ) {
+        throw new Error('Pool does not exist');
+      }
+
+      console.log(`Using pool: ${poolAddress}`);
+
+      // Get quote from Quoter contract
+      const result = await publicClient.simulateContract({
+        address: QUOTER_CONTRACT_ADDRESS,
+        abi: UniswapQuoterAbi,
+        functionName: 'quoteExactInputSingle',
+        args: [
+          {
+            tokenIn: WETH_ADDRESS,
+            tokenOut: USDC_ADDRESS,
+            fee: 3000,
+            recipient: safeSmartAccount!.address,
+            deadline: Math.floor(new Date().getTime() / 1000 + 60 * 10),
+            amountIn: amountIn,
+            sqrtPriceLimitX96: 0n,
+          },
+        ],
+      });
+      console.log('🚀 ~ getWethToUsdcQuote ~ result:', result);
+      const amountOut = result.result[0];
+
+      return amountOut;
+    } catch (error) {
+      console.error('Error getting quote:', error);
+      if (error instanceof Error) {
+        console.error('Error details:', error.message);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Create calldata for swapping ETH to USDC
+   * @param amountIn Amount of ETH to swap (in wei)
+   * @param slippagePercentage Slippage tolerance (e.g., 0.5 for 0.5%)
+   * @returns Encoded function data for the swap
+   */
+  async function createWethToUsdcSwapCalldata(
+    amountIn: bigint,
+    slippagePercentage: number = 0.5,
+  ): Promise<Hex> {
+    // Get expected amount out
+    const expectedAmountOut = await getWethToUsdcQuote(amountIn);
+
+    // Calculate minimum amount out based on slippage
+    const slippageBps = BigInt(Math.floor(slippagePercentage * 100));
+    const minAmountOut =
+      expectedAmountOut - (expectedAmountOut * slippageBps) / 10000n;
+
+    // Encode the function call
+    const calldata = encodeFunctionData({
+      abi: UniswapSwapRouterAbi,
+      functionName: 'exactInputSingle',
+      args: [
+        {
+          tokenIn: WETH_ADDRESS,
+          tokenOut: USDC_ADDRESS,
+          fee: 3000, // 0.3% fee tier
+          recipient: safeSmartAccount!.address,
+          amountIn,
+          amountOutMinimum: minAmountOut,
+          sqrtPriceLimitX96: 0n, // No price limit
+        },
+      ],
+    });
+
+    return calldata;
+  }
+
   const swapWETHToUSDC = async () => {
     try {
       if (!safeSmartAccount || !smartAccountClient) {
         throw new Error('Smart account or smart account client not found');
       }
 
-      // Amount of WETH to swap (0.000001 WETH)
-      const amountIn = parseEther('0.000001');
+      const amountIn = parseEther('0.001');
 
-      // Get current timestamp and add 20 minutes for deadline
-      const deadline = Math.floor(Date.now() / 1000) + 1200;
+      // Get expected amount out for logging
+      const expectedAmountOut = await getWethToUsdcQuote(amountIn);
+      console.log(
+        `Expected to receive approximately ${formatUnits(
+          expectedAmountOut,
+          6,
+        )} USDC for ${amountIn} WETH`,
+      );
 
-      // Prepare the swap parameters
-      const params: ExactInputSingleParams = {
-        tokenIn: WETH_ADDRESS as `0x${string}`,
-        tokenOut: USDC_ADDRESS as `0x${string}`,
-        fee: 3000, // 0.3% fee tier
-        recipient: safeSmartAccount.address as `0x${string}`,
-        deadline: BigInt(deadline),
-        amountIn: amountIn,
-        amountOutMinimum: BigInt(0), // No minimum amount out (be careful with this in production!)
-        sqrtPriceLimitX96: BigInt(0), // No price limit
-      };
+      // Create the swap calldata
+      const swapCalldata = await createWethToUsdcSwapCalldata(amountIn);
 
       // Send the transaction
       const txHash = await smartAccountClient.sendUserOperation({
         account: safeSmartAccount,
         calls: [
           {
-            to: WETH_ADDRESS as `0x${string}`, //WETH
-            abi: parseAbi(['function approve(address,uint)']),
-            functionName: 'approve',
-            args: [UNISWAP_SEPOLIA_V3_ROUTER, parseEther('0.000001')],
-          },
-          {
-            to: UNISWAP_SEPOLIA_V3_ROUTER, //UniV3 Router
-            abi: SwapRouterABI,
-            functionName: 'exactInputSingle',
-            args: [
-              [
-                params.tokenIn,
-                params.tokenOut,
-                params.fee,
-                params.recipient,
-                params.deadline,
-                params.amountIn,
-                params.amountOutMinimum,
-                params.sqrtPriceLimitX96,
-              ],
-            ],
+            to: UNISWAP_SEPOLIA_V3_ROUTER,
+            data: swapCalldata,
+            value: amountIn,
           },
         ],
       });
@@ -596,7 +664,7 @@ export default function Home() {
 
     //@WRAP-CALL: Add the wrap call to the calls
     console.log('Adding wrap call to the calls');
-    const amountIn = parseEther('0.000001');
+    const amountIn = parseEther(transactions[0].value);
 
     calls.push({
       to: WETH_ADDRESS,
@@ -609,46 +677,23 @@ export default function Home() {
 
     //@SWAP-CALL: Add the swap call to the calls
     console.log('Adding swap call to the calls');
-    // Get current timestamp and add 20 minutes for deadline
-    const deadline = Math.floor(Date.now() / 1000) + 1200;
-
-    // Prepare the swap parameters
-    const params: ExactInputSingleParams = {
-      tokenIn: WETH_ADDRESS as `0x${string}`,
-      tokenOut: USDC_ADDRESS as `0x${string}`,
-      fee: 3000, // 0.3% fee tier
-      recipient: safeSmartAccount.address as `0x${string}`,
-      deadline: BigInt(deadline),
-      amountIn: amountIn,
-      amountOutMinimum: BigInt(0), // No minimum amount out (be careful with this in production!)
-      sqrtPriceLimitX96: BigInt(0), // No price limit
-    };
-
-    calls.push(
-      {
-        to: WETH_ADDRESS as `0x${string}`, //WETH
-        abi: parseAbi(['function approve(address,uint)']),
-        functionName: 'approve',
-        args: [UNISWAP_SEPOLIA_V3_ROUTER, parseEther('0.000001')],
-      },
-      {
-        to: UNISWAP_SEPOLIA_V3_ROUTER, //UniV3 Router
-        abi: SwapRouterABI,
-        functionName: 'exactInputSingle',
-        args: [
-          [
-            params.tokenIn,
-            params.tokenOut,
-            params.fee,
-            params.recipient,
-            params.deadline,
-            params.amountIn,
-            params.amountOutMinimum,
-            params.sqrtPriceLimitX96,
-          ],
-        ],
-      },
+    // Get expected amount out for logging
+    const expectedAmountOut = await getWethToUsdcQuote(amountIn);
+    console.log(
+      `Expected to receive approximately ${formatUnits(
+        expectedAmountOut,
+        6,
+      )} USDC for ${amountIn} WETH`,
     );
+
+    // Create the swap calldata
+    const swapCalldata = await createWethToUsdcSwapCalldata(amountIn);
+
+    calls.push({
+      to: UNISWAP_SEPOLIA_V3_ROUTER,
+      data: swapCalldata,
+      value: amountIn,
+    });
 
     //-------------------------------------------------------
 
@@ -893,18 +938,16 @@ export default function Home() {
             </p>
 
             <h2>Wrap ETH to WETH</h2>
-            <button onClick={swapEthToWETH}>Wrap 0.000001 ETH to WETH</button>
+            <button onClick={wrapEthToWETH}>Wrap 0.000001 ETH to WETH</button>
 
             <h2>Swap WETH to USDC</h2>
-            <button onClick={swapWETHToUSDC}>Swap 0.000001 ETH to USDC</button>
+            <button onClick={swapWETHToUSDC}>Swap 0.001 ETH to USDC</button>
 
             <p style={{ textAlign: 'center' }}>
               ---------------------------------------------------------------------
             </p>
 
-            <h2>
-              Send ETH + WRAP ETH + SWAP WETH to USDC + Paymaster (0.000001)
-            </h2>
+            <h2>Send ETH + WRAP ETH + SWAP WETH to USDC + Paymaster</h2>
             <button onClick={sendWrapSwapPaymaster}>
               Send ETH + WRAP ETH + SWAP WETH to USDC + Paymaster
             </button>
